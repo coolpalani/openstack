@@ -1,0 +1,247 @@
+heat_template_version: 2013-05-23
+
+description: >
+  Heat WordPress template for mPAC Cloud Platform
+
+parameters:
+
+  key_name:
+    type: string
+    description: Name of a KeyPair to enable SSH access to the instance
+    default: rhosp-selena
+    constraints:
+        - allowed_values: [mpac_web, rhosp-selena]
+  instance_type:
+    type: string
+    description: Instance type for WordPress server
+    default: m1.small
+    constraints:
+        - allowed_values: [m1.small, m1.medium, m1.large, m1.xlarge]
+  image_id:
+    type: string
+    description: >
+     Using a CentOS 7 image for the wordpress deployment
+    default: centos-7.3-x86_64
+    constraints:
+        - allowed_values: [centos-7.3-x86_64]
+  Sec_Group:
+    type: string
+    description: Security Group to use for the Wordpress Server
+    default: WEB
+  SQL_Sec_Group:
+    type: string
+    description: Security Group to use for the Wordpress Server
+    default: SQL
+  public_net:
+    type: string
+    description: External Network
+    default: public
+
+  db_name:
+    type: string
+    description: WordPress database name
+    default: wordpress
+    constraints:
+      - length: { min: 1, max: 64 }
+        description: db_name must be between 1 and 64 characters
+      - allowed_pattern: '[a-zA-Z][a-zA-Z0-9]*'
+        description: >
+          db_name must begin with a letter and contain only alphanumeric
+          characters
+  db_username:
+    type: string
+    description: The WordPress database admin account username
+    default: admin
+    hidden: true
+    constraints:
+      - length: { min: 1, max: 16 }
+        description: db_username must be between 1 and 16 characters
+      - allowed_pattern: '[a-zA-Z][a-zA-Z0-9]*'
+        description: >
+          db_username must begin with a letter and contain only alphanumeric
+          characters
+  db_password:
+    type: string
+    description: The WordPress database admin account password
+    default: admin
+    hidden: true
+    constraints:
+      - length: { min: 1, max: 41 }
+        description: db_password must be between 1 and 41 characters
+      - allowed_pattern: '[a-zA-Z0-9]*'
+        description: db_password must contain only alphanumeric characters
+  db_root_password:
+    type: string
+    description: Root password for MySQL
+    default: admin
+    hidden: true
+    constraints:
+      - length: { min: 1, max: 41 }
+        description: db_root_password must be between 1 and 41 characters
+      - allowed_pattern: '[a-zA-Z0-9]*'
+        description: db_root_password must contain only alphanumeric characters
+
+resources:
+  private_net:
+        type: OS::Neutron::Net
+        properties:
+          name: WEB
+
+  private_subnet:
+        type: OS::Neutron::Subnet
+        properties:
+          network_id: { get_resource: private_net }
+          cidr: 172.17.7.0/28
+          gateway_ip: 172.17.7.1
+          dns_nameservers: ["10.0.0.1"]
+  router1:
+        type: OS::Neutron::Router
+        properties:
+          external_gateway_info:
+                network: public
+
+  Web_Interface:
+        type: OS::Neutron::RouterInterface
+        properties:
+          router_id: { get_resource: router1 }
+          subnet_id: { get_resource: private_subnet }
+
+  SQL_Interface:
+        type: OS::Neutron::RouterInterface
+        properties:
+          router_id: { get_resource: router1 }
+          subnet_id: { get_resource: private_sql_subnet }
+
+  server1_port:
+        type: OS::Neutron::Port
+        properties:
+          network_id: { get_resource: private_net }
+          security_groups: [ get_param: Sec_Group ]
+          fixed_ips:
+                - subnet_id: { get_resource: private_subnet }
+
+  server1_floating_ip:
+        type: OS::Neutron::FloatingIP
+        properties:
+          floating_network_id: { get_param: public_net }
+          port_id: { get_resource: server1_port }
+
+  wordpress_instance:
+    type: OS::Nova::Server
+    properties:
+      image: { get_param: image_id }
+      flavor: { get_param: instance_type }
+      key_name: { get_param: key_name }
+      networks:
+      - port: {get_resource: server1_port}
+
+
+      user_data:
+        str_replace:
+          template: |
+            #!/bin/bash -v
+
+            rpm -Uvh https://dl.fedoraproject.org/pub/epel/7/x86_64/e/epel-release-7-10.noarch.rpm
+            yum -y install httpd wordpress
+ 
+            echo 0 > /selinux/enforce
+            systemctl disable firewalld
+            systemctl enable httpd.service
+            systemctl start httpd.service
+
+            #Configure Files for Wordpress.
+            sed -i 's/SELINUX=.*/SELINUX=disabled/' /etc/selinux/config
+            sed -i "/Deny from All/d" /etc/httpd/conf.d/wordpress.conf
+            sed -i "s/Require local/Require all granted/" /etc/httpd/conf.d/wordpress.conf
+            sed -i s/database_name_here/wordpress/ /usr/share/wordpress/wp-config.php
+            sed -i s/username_here/wordpress/ /usr/share/wordpress/wp-config.php
+            sed -i s/password_here/wordpress/ /usr/share/wordpress/wp-config.php
+            sed -i s/localhost/db_ip/ /usr/share/wordpress/wp-config.php
+
+            reboot
+          params:
+            db_rootpassword: { get_param: db_root_password }
+            db_name: { get_param: db_name }
+            db_user: { get_param: db_username }
+            db_password: { get_param: db_password }
+            db_ip: {get_attr: [sql_instance, first_address]}
+            
+  private_sql_net:
+        type: OS::Neutron::Net
+        properties:
+          name: SQL
+
+  private_sql_subnet:
+        type: OS::Neutron::Subnet
+        properties:
+          network_id: { get_resource: private_sql_net}
+          cidr: 172.17.8.0/28
+          gateway_ip: 172.17.8.1
+          dns_nameservers: ["8.8.8.8"]
+
+  server2_port:
+        type: OS::Neutron::Port
+        properties:
+          network_id: { get_resource: private_sql_net }
+          security_groups: [ get_param: SQL_Sec_Group ]
+          fixed_ips:
+                - subnet_id: { get_resource: private_sql_subnet }
+
+  server2_floating_ip:
+        type: OS::Neutron::FloatingIP
+        properties:
+          floating_network_id: { get_param: public_net }
+          port_id: { get_resource: server2_port }
+
+  sql_instance:
+    type: OS::Nova::Server
+    properties:
+      image: { get_param: image_id }
+      flavor: { get_param: instance_type }
+      key_name: { get_param: key_name }
+      networks:
+      - port: { get_resource: server2_port}
+
+
+      user_data:
+        str_replace:
+          template: |
+            #!/bin/bash -v
+
+            rpm -Uvh https://dl.fedoraproject.org/pub/epel/7/x86_64/e/epel-release-7-10.noarch.rpm
+            yum -y install mariadb mariadb-server
+            touch /var/log/mariadb/mariadb.log
+            chown mysql.mysql /var/log/mariadb/mariadb.log
+            systemctl enable mariadb.service
+            systemctl start mariadb.service
+            echo 0 > /selinux/enforce
+            systemctl disable firewalld
+            sed -i 's/SELINUX=.*/SELINUX=disabled/' /etc/selinux/config
+
+
+            # Setup MySQL root password and create a user
+            cat << EOF | mysql -u root 
+            CREATE DATABASE wordpress;
+            CREATE USER wordpress@localhost IDENTIFIED BY 'wordpress';
+            GRANT ALL PRIVILEGES ON wordpress.* TO "wordpress"@"172.17.7.0/255.255.255.240" IDENTIFIED BY 'wordpress';
+            FLUSH PRIVILEGES;
+            EXIT
+            EOF
+            reboot
+            systemctl start mariadb.service
+            systemctl start httpd.service
+
+          params:
+            db_rootpassword: { get_param: db_root_password }
+            db_name: { get_param: db_name }
+            db_user: { get_param: db_username }
+            db_password: { get_param: db_password }
+
+outputs:
+  SQL_IP:
+    description: IP Address for SQL Server
+    value:
+      str_replace:
+        template: http://host/wordpress
+        params:
+          host: { get_attr: [wordpress_instance, first_address] }
